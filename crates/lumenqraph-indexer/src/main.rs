@@ -56,6 +56,7 @@ use config::Config;
 use deep_backfill::{GalexieSource, HistoricalSource};
 use lumenqraph_core::ContractSpec;
 use rpc_client::RpcClient;
+use reenrich::ReenrichOptions;
 
 /// Postgres advisory lock id used to elect a single active indexer.
 const INDEXER_LOCK_ID: i64 = 0x6c756d656e717261; // "lumenqra" as i64
@@ -145,6 +146,20 @@ fn parse_backfill_ledger(arg: Option<&str>) -> anyhow::Result<Option<u32>> {
     }
 }
 
+fn parse_reenrich_options(args: &[String]) -> anyhow::Result<ReenrichOptions> {
+    let mut options = ReenrichOptions::default();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--force" => options.force = true,
+            "--contract" => options.contract = Some(iter.next().context("--contract requires a value")?.clone()),
+            value if value.starts_with("--contract=") => options.contract = Some(value["--contract=".len()..].to_string()),
+            other => anyhow::bail!("unknown reenrich option: {other}"),
+        }
+    }
+    Ok(options)
+}
+
 /// A leader lock held on a dedicated Postgres connection that is never
 /// returned to the pool. Advisory locks are session-scoped, so the lock lives
 /// exactly as long as this connection. If the connection drops (idle timeout,
@@ -158,109 +173,24 @@ impl LeaderLock {
     /// Acquire the leader lock on a dedicated connection. If another instance
     /// holds it, block until it is released (hot standby).
     async fn acquire(pool: &sqlx::PgPool) -> anyhow::Result<Self> {
-        // Detach a connection from the pool so it is never handed back while
-        // we hold the session-scoped advisory lock.
         let mut conn = pool
             .acquire()
             .await
             .context("failed to acquire advisory lock (blocking)")?;
-    }
-
-    info!("indexer leader lock acquired; this instance is now active");
-
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .context("failed to run migrations")?;
-
-    if args.get(1).map(String::as_str) == Some("reenrich") {
-        info!("running in reenrich mode");
-        let result = reenrich::run_reenrich(pool.clone(), rpc, config).await;
-
-        // Release the advisory lock on exit.
-        info!("releasing indexer leader lock");
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(INDEXER_LOCK_ID)
-            .execute(&pool)
-            .await;
-
-        return result;
-    }
-
-    if args.get(1).map(String::as_str) == Some("backfill") {
-        let from = args
-            .get(2)
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(config.start_ledger);
-        info!(from, "running in backfill mode");
-        let result = backfill::run(pool.clone(), rpc, config, from).await;
-
-        // Release the advisory lock on exit.
-        info!("releasing indexer leader lock");
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(INDEXER_LOCK_ID)
-            .execute(&pool)
-            .await;
-
-        return result;
-    }
-
-    // deep-backfill: ingest beyond the RPC retention window from a data-lake
-    // source. Parse manual args: --from, --to, --source, --input (repeatable).
-    if args.get(1).map(String::as_str) == Some("deep-backfill") {
-        let result = run_deep_backfill(args, pool.clone(), config).await;
-        
-        // Release the advisory lock on exit.
-        info!("releasing indexer leader lock");
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(INDEXER_LOCK_ID)
-            .execute(&pool)
-            .await;
-        
-        return result;
-    }
-
-    if args.get(1).map(String::as_str) == Some("recover-gaps") {
-        info!("running in recover-gaps mode");
-        let specs = specs::SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
-        let result = poller::recover_gaps(&pool, &rpc, &config, &specs).await;
-
-        // Release the advisory lock on exit.
-        info!("releasing indexer leader lock");
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(INDEXER_LOCK_ID)
-            .execute(&pool)
-            .await;
-
-        return result;
-    }
-
-    info!(
-        rpc = %config.rpc_url,
-        contracts = ?config.contract_ids,
-        poll_secs = config.poll_interval_secs,
-        "starting lumenqraph indexer (live)"
-    );
-
         info!("acquiring indexer leader lock (id {})", INDEXER_LOCK_ID);
         let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
             .bind(INDEXER_LOCK_ID)
             .fetch_one(&mut *conn)
             .await
             .context("failed to acquire advisory lock")?;
-
         if !acquired {
-            info!(
-                "another indexer instance holds the leader lock; \
-                 blocking until it releases (this instance will become a hot standby)"
-            );
+            info!("another indexer instance holds the leader lock; blocking until it releases");
             sqlx::query("SELECT pg_advisory_lock($1)")
                 .bind(INDEXER_LOCK_ID)
                 .execute(&mut *conn)
                 .await
                 .context("failed to acquire advisory lock (blocking)")?;
         }
-
         info!("indexer leader lock acquired; this instance is now active");
         Ok(Self { conn })
     }
@@ -376,7 +306,8 @@ async fn main() -> anyhow::Result<()> {
 
     if args.get(1).map(String::as_str) == Some("reenrich") {
         info!("running in reenrich mode");
-        return reenrich::run_reenrich(pool, rpc, config).await;
+        let options = parse_reenrich_options(&args[2..])?;
+        return reenrich::run_reenrich(pool, rpc, config, options).await;
     }
 
     if args.get(1).map(String::as_str) == Some("backfill") {
