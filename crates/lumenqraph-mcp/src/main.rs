@@ -65,6 +65,56 @@ where
     }
 }
 
+fn select_rpc_url(
+    configured: Option<&str>,
+    network_passphrase: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(url) = configured.filter(|url| !url.trim().is_empty()) {
+        return Ok(url.to_string());
+    }
+
+    let passphrase = network_passphrase
+        .filter(|passphrase| !passphrase.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "RPC_URL is unset and indexer_cursor.network_passphrase is unavailable; \
+                 set RPC_URL explicitly or start the indexer first"
+            )
+        })?;
+
+    let url = match passphrase.trim() {
+        "Public Global Stellar Network ; September 2015" => "https://mainnet.sorobanrpc.com",
+        "Test SDF Network ; September 2015" => "https://soroban-testnet.stellar.org",
+        "Test SDF Future Network ; October 2022" => "https://rpc-futurenet.stellar.org",
+        _ => {
+            anyhow::bail!(
+                "RPC_URL is unset and no default RPC endpoint is known for indexed network \
+                 passphrase {passphrase:?}; set RPC_URL explicitly"
+            )
+        }
+    };
+    Ok(url.to_string())
+}
+
+async fn resolve_rpc_url(pool: &PgPool, configured: Option<String>) -> anyhow::Result<String> {
+    let network_passphrase = if configured
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty())
+    {
+        None
+    } else {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT network_passphrase FROM indexer_cursor WHERE id = 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .context("failed to read indexer_cursor.network_passphrase")?
+        .flatten()
+    };
+
+    select_rpc_url(configured.as_deref(), network_passphrase.as_deref())
+}
+
 #[derive(Clone)]
 pub struct State {
     pub pool: PgPool,
@@ -123,8 +173,6 @@ async fn main() -> anyhow::Result<()> {
     lumenqraph_core::telemetry::init_tracing_stderr();
 
     let database_url = std::env::var("DATABASE_URL").context("missing DATABASE_URL")?;
-    let rpc_url = std::env::var("RPC_URL")
-        .unwrap_or_else(|_| "https://soroban-testnet.stellar.org".to_string());
     let rpc_timeout_secs: u64 = std::env::var("RPC_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.trim().parse().ok())

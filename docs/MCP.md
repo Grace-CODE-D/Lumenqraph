@@ -99,7 +99,7 @@ Put it behind TLS (a reverse proxy or a load balancer) — the transport itself 
 | Variable | Required | Default | Notes |
 | --- | --- | --- | --- |
 | `DATABASE_URL` | ✅ | — | Postgres connection string, e.g. `postgres://user:pass@host:5432/db` |
-| `RPC_URL` | ❌ | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint for `call_contract` and `simulate_call` |
+| `RPC_URL` | ❌ | Detected from the indexed network | Stellar RPC endpoint for `call_contract` and `simulate_call`; overrides automatic detection when set |
 | `RPC_TIMEOUT_SECS` | ❌ | `30` | Timeout for RPC calls in seconds |
 | `MCP_AUTH_TOKEN` | ❌ (stdio) / ✅ (HTTP) | — | Bearer token required in `Authorization` field during `initialize`. **Required to start the HTTP transport** unless `MCP_HTTP_ALLOW_ANONYMOUS=true`. |
 | `MCP_HTTP_BIND` | ❌ | unset (stdio) | Address to bind the HTTP transport. Bare ports (`:8090` or `8090`) default to `127.0.0.1`. Use `0.0.0.0:8090` to expose on all interfaces (requires `MCP_AUTH_TOKEN`). |
@@ -120,6 +120,13 @@ MCP_AUTH_TOKEN=your-secret-token
 # Optional: restrict which browser Origins may call the HTTP transport
 # MCP_ALLOWED_ORIGINS=https://your-app.example.com
 ```
+
+When `RPC_URL` is unset or blank, the MCP server reads
+`indexer_cursor.network_passphrase` and selects the matching public RPC endpoint
+for Stellar mainnet, testnet, or futurenet. The indexer must have stored its
+network passphrase before the MCP server starts. For custom networks or an
+uninitialized indexer, set `RPC_URL` explicitly; startup fails rather than
+silently sending RPC calls to the wrong network.
 
 ## Tools
 
