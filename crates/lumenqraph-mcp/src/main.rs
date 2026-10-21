@@ -1163,6 +1163,79 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs postgres"]
+    async fn query_events_is_compact_by_default_and_include_raw_restores_full_row() {
+        let state = fixture_state().await;
+        let event_id = uuid::Uuid::new_v4().to_string();
+        let raw_topics = json!(["A".repeat(80), "B".repeat(80), "C".repeat(80)]);
+        let raw_value = "D".repeat(172);
+        sqlx::query(
+            "INSERT INTO events (
+                event_id, contract_id, ledger, ledger_closed_at, event_type,
+                topics, decoded_topics, event_name, value, decoded_value,
+                enriched, tx_hash, in_successful_call, paging_token
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+        )
+        .bind(&event_id)
+        .bind("CNOPE")
+        .bind(42_i64)
+        .bind(chrono::Utc::now())
+        .bind("contract")
+        .bind(raw_topics.clone())
+        .bind(json!(["transfer"]))
+        .bind("transfer")
+        .bind(&raw_value)
+        .bind(json!({"amount": "100"}))
+        .bind(json!({"amount": {"type": "i128", "value": "100"}}))
+        .bind("tx-1")
+        .bind(true)
+        .bind("paging-1")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let compact = tools::call(
+            &state,
+            "query_events",
+            &json!({"contract_id": "CNOPE", "limit": 5}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(compact["count"], 1);
+        let event = &compact["events"][0];
+        assert_eq!(event["event_id"], event_id);
+        assert_eq!(event["name"], "transfer");
+        assert_eq!(
+            event["params"],
+            json!({"amount": {"type": "i128", "value": "100"}})
+        );
+        assert!(event.get("topics").is_none());
+        assert!(event.get("value").is_none());
+
+        let full = tools::call(
+            &state,
+            "query_events",
+            &json!({"contract_id": "CNOPE", "include_raw": true}),
+        )
+        .await
+        .unwrap();
+        let event = &full["events"][0];
+        assert_eq!(event["topics"], raw_topics);
+        assert_eq!(event["value"], raw_value);
+        assert_eq!(event["decoded_value"], json!({"amount": "100"}));
+        assert_eq!(
+            event["enriched"],
+            json!({"amount": {"type": "i128", "value": "100"}})
+        );
+        let compact_bytes = serde_json::to_vec(&compact["events"][0]).unwrap().len();
+        let full_bytes = serde_json::to_vec(event).unwrap().len();
+        assert!(
+            compact_bytes * 2 <= full_bytes,
+            "compact result is not at least 50% smaller ({compact_bytes} vs {full_bytes} bytes)"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres"]
     async fn get_contract_interface_errors_for_unindexed_contract() {
         let state = fixture_state().await;
         let err = tools::call(

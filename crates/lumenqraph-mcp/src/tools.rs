@@ -21,6 +21,54 @@ pub fn definitions() -> Value {
         "properties": {},
         "additionalProperties": true
     });
+    let compact_event_schema = json!({
+        "type": "object",
+        "properties": {
+            "event_id": { "type": "string" },
+            "contract_id": { "type": "string" },
+            "ledger": { "type": "integer" },
+            "closed_at": { "type": "string", "format": "date-time" },
+            "event_type": { "type": "string", "enum": ["contract", "system", "diagnostic"] },
+            "name": { "type": ["string", "null"] },
+            "tx_hash": { "type": "string" },
+            "params": {},
+            "in_successful_call": { "type": "boolean" }
+        },
+        "required": [
+            "event_id", "contract_id", "ledger", "closed_at", "event_type",
+            "name", "tx_hash", "params", "in_successful_call"
+        ],
+        "additionalProperties": false
+    });
+    let full_event_schema = json!({
+        "type": "object",
+        "properties": {
+            "event_id": { "type": "string" },
+            "contract_id": { "type": "string" },
+            "ledger": { "type": "integer" },
+            "ledger_closed_at": { "type": "string", "format": "date-time" },
+            "event_type": { "type": "string", "enum": ["contract", "system", "diagnostic"] },
+            "topics": { "type": "array", "items": { "type": "string" } },
+            "decoded_topics": {},
+            "event_name": { "type": ["string", "null"] },
+            "value": { "type": "string" },
+            "decoded_value": {},
+            "enriched": {},
+            "tx_hash": { "type": "string" },
+            "in_successful_call": { "type": "boolean" },
+            "paging_token": { "type": "string" },
+            "created_at": { "type": "string", "format": "date-time" }
+        },
+        "required": [
+            "event_id", "contract_id", "ledger", "ledger_closed_at", "event_type",
+            "topics", "decoded_topics", "event_name", "value", "decoded_value",
+            "enriched", "tx_hash", "in_successful_call", "paging_token", "created_at"
+        ],
+        "additionalProperties": false
+    });
+    let event_schema = json!({
+        "oneOf": [compact_event_schema, full_event_schema]
+    });
     json!([
         {
             "name": "list_contracts",
@@ -80,41 +128,69 @@ pub fn definitions() -> Value {
         },
         {
             "name": "query_events",
-            "description": "Query recent indexed events for a contract, newest first. Each event includes decoded topics/value and, when available, a named+typed 'enriched' record.",
+            "description": "Query recent indexed events for a contract, newest first. Results use a compact event shape with params set to the enriched record when available, otherwise the decoded value. Set include_raw=true to return the complete event rows, including raw XDR.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "contract_id": { "type": "string", "description": "Contract id (C...)" },
                     "event_name": { "type": "string", "description": "Optional event name filter, e.g. 'transfer'" },
-                    "limit": { "type": "integer", "description": "Max events (1-200, default 20)" }
+                    "limit": { "type": "integer", "description": "Max events (1-200, default 20)" },
+                    "include_raw": { "type": "boolean", "description": "Return complete event rows including raw XDR (default false)" }
                 },
                 "required": ["contract_id"], "additionalProperties": false
             },
-            "outputSchema": base_output.clone()
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "contract_id": { "type": "string" },
+                    "count": { "type": "integer" },
+                    "events": { "type": "array", "items": event_schema.clone() }
+                },
+                "required": ["contract_id", "count", "events"],
+                "additionalProperties": false
+            }
         },
         {
             "name": "get_event",
-            "description": "Fetch a single indexed event by its unique event id, including the raw topics/value and any decoded enrichment.",
+            "description": "Fetch a single indexed event by its unique event id. Results use a compact event shape with params set to the enriched record when available, otherwise the decoded value. Set include_raw=true to return the complete row, including raw XDR.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "event_id": { "type": "string", "description": "Unique event id" } },
+                "properties": {
+                    "event_id": { "type": "string", "description": "Unique event id" },
+                    "include_raw": { "type": "boolean", "description": "Return the complete event row including raw XDR (default false)" }
+                },
                 "required": ["event_id"], "additionalProperties": false
             },
-            "outputSchema": base_output.clone()
+            "outputSchema": {
+                "type": "object",
+                "properties": { "event": event_schema.clone() },
+                "required": ["event"],
+                "additionalProperties": false
+            }
         },
         {
             "name": "get_transaction_events",
-            "description": "List every indexed event for a transaction, preserving the original on-chain emission order and optionally filtering only successful calls.",
+            "description": "List every indexed event for a transaction in on-chain emission order. Results use a compact event shape with params set to the enriched record when available, otherwise the decoded value. Set include_raw=true to return complete event rows, including raw XDR.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "tx_hash": { "type": "string", "description": "Transaction hash (hex or XDR string)" },
                     "limit": { "type": "integer", "description": "Max events to return (1-1000, default 100)" },
-                    "successful_only": { "type": "boolean", "description": "Only include events from successful calls" }
+                    "successful_only": { "type": "boolean", "description": "Only include events from successful calls" },
+                    "include_raw": { "type": "boolean", "description": "Return complete event rows including raw XDR (default false)" }
                 },
                 "required": ["tx_hash"], "additionalProperties": false
             },
-            "outputSchema": base_output.clone()
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "tx_hash": { "type": "string" },
+                    "count": { "type": "integer" },
+                    "events": { "type": "array", "items": event_schema }
+                },
+                "required": ["tx_hash", "count", "events"],
+                "additionalProperties": false
+            }
         },
         {
             "name": "get_contract_stats",
@@ -285,16 +361,25 @@ pub async fn call(state: &State, name: &str, args: &Value) -> anyhow::Result<Val
                 str_arg(args, "contract_id")?,
                 args.get("event_name").and_then(Value::as_str),
                 args.get("limit").and_then(Value::as_i64),
+                args.get("include_raw").and_then(Value::as_bool).unwrap_or(false),
             )
             .await
         }
-        "get_event" => get_event(state, str_arg(args, "event_id")?).await,
+        "get_event" => {
+            get_event(
+                state,
+                str_arg(args, "event_id")?,
+                args.get("include_raw").and_then(Value::as_bool).unwrap_or(false),
+            )
+            .await
+        }
         "get_transaction_events" => {
             get_transaction_events(
                 state,
                 str_arg(args, "tx_hash")?,
                 args.get("limit").and_then(Value::as_i64),
                 args.get("successful_only").and_then(Value::as_bool),
+                args.get("include_raw").and_then(Value::as_bool).unwrap_or(false),
             )
             .await
         }
@@ -572,6 +657,7 @@ async fn query_events(
     contract_id: &str,
     event_name: Option<&str>,
     limit: Option<i64>,
+    include_raw: bool,
 ) -> anyhow::Result<Value> {
     validate_contract_id(contract_id)?;
     let limit = limit.unwrap_or(20).clamp(1, 200);
@@ -588,10 +674,14 @@ async fn query_events(
     .bind(limit)
     .fetch_all(&state.pool)
     .await?;
+    let events: Vec<Value> = events
+        .into_iter()
+        .map(|event| event_output(event, include_raw))
+        .collect::<anyhow::Result<_>>()?;
     Ok(json!({ "contract_id": contract_id, "count": events.len(), "events": events }))
 }
 
-async fn get_event(state: &State, event_id: &str) -> anyhow::Result<Value> {
+async fn get_event(state: &State, event_id: &str, include_raw: bool) -> anyhow::Result<Value> {
     let row: Option<EventRow> = sqlx::query_as(
         "SELECT event_id, contract_id, ledger, ledger_closed_at, event_type,
                 topics, decoded_topics, event_name, value, decoded_value,
@@ -603,7 +693,7 @@ async fn get_event(state: &State, event_id: &str) -> anyhow::Result<Value> {
     .fetch_optional(&state.pool)
     .await?;
     match row {
-        Some(event) => Ok(json!({ "event": event })),
+        Some(event) => Ok(json!({ "event": event_output(event, include_raw)? })),
         None => anyhow::bail!("no event found with id '{event_id}'"),
     }
 }
@@ -613,6 +703,7 @@ async fn get_transaction_events(
     tx_hash: &str,
     limit: Option<i64>,
     successful_only: Option<bool>,
+    include_raw: bool,
 ) -> anyhow::Result<Value> {
     let limit = limit.unwrap_or(100).clamp(1, 1000);
     let events: Vec<EventRow> = sqlx::query_as(
@@ -630,7 +721,133 @@ async fn get_transaction_events(
     .bind(limit)
     .fetch_all(&state.pool)
     .await?;
+    let events: Vec<Value> = events
+        .into_iter()
+        .map(|event| event_output(event, include_raw))
+        .collect::<anyhow::Result<_>>()?;
     Ok(json!({ "tx_hash": tx_hash, "count": events.len(), "events": events }))
+}
+
+fn event_output(event: EventRow, include_raw: bool) -> anyhow::Result<Value> {
+    if include_raw {
+        return Ok(serde_json::to_value(event)?);
+    }
+
+    let params = event
+        .enriched
+        .map(|enriched| enriched.0)
+        .unwrap_or(event.decoded_value.0);
+    Ok(json!({
+        "event_id": event.event_id,
+        "contract_id": event.contract_id,
+        "ledger": event.ledger,
+        "closed_at": event.ledger_closed_at,
+        "event_type": event.event_type,
+        "name": event.event_name,
+        "tx_hash": event.tx_hash,
+        "params": params,
+        "in_successful_call": event.in_successful_call
+    }))
+}
+
+#[cfg(test)]
+mod event_output_tests {
+    use super::event_output;
+    use lumenqraph_core::{EventRow, EventType};
+    use serde_json::{json, Value};
+    use sqlx::types::Json;
+
+    #[test]
+    fn compact_event_omits_raw_xdr_and_uses_enriched_params() {
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let event = EventRow {
+            event_id: "event-1".to_owned(),
+            contract_id: "contract-1".to_owned(),
+            ledger: 42,
+            ledger_closed_at: timestamp.clone(),
+            event_type: EventType::Contract,
+            topics: Json(vec!["raw-topic-xdr".to_owned()]),
+            decoded_topics: Json(json!(["transfer"])),
+            event_name: Some("transfer".to_owned()),
+            value: "raw-value-xdr".to_owned(),
+            decoded_value: Json(json!({"amount": "100"})),
+            enriched: Some(Json(json!({"amount": {"type": "i128", "value": "100"}}))),
+            tx_hash: "tx-1".to_owned(),
+            in_successful_call: true,
+            paging_token: "paging-1".to_owned(),
+            created_at: timestamp,
+        };
+
+        let compact = event_output(event, false).unwrap();
+
+        assert!(compact.get("topics").is_none());
+        assert!(compact.get("value").is_none());
+        assert!(compact.get("decoded_topics").is_none());
+        assert!(compact.get("decoded_value").is_none());
+        assert_eq!(compact["params"], json!({"amount": {"type": "i128", "value": "100"}}));
+        assert_eq!(compact["event_id"], Value::String("event-1".to_owned()));
+        assert_eq!(compact["tx_hash"], Value::String("tx-1".to_owned()));
+    }
+
+    #[test]
+    fn compact_event_falls_back_to_decoded_value() {
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let event = EventRow {
+            event_id: "event-1".to_owned(),
+            contract_id: "contract-1".to_owned(),
+            ledger: 42,
+            ledger_closed_at: timestamp.clone(),
+            event_type: EventType::Contract,
+            topics: Json(vec!["raw-topic-xdr".to_owned()]),
+            decoded_topics: Json(json!(["transfer"])),
+            event_name: Some("transfer".to_owned()),
+            value: "raw-value-xdr".to_owned(),
+            decoded_value: Json(json!({"amount": "100"})),
+            enriched: None,
+            tx_hash: "tx-1".to_owned(),
+            in_successful_call: true,
+            paging_token: "paging-1".to_owned(),
+            created_at: timestamp,
+        };
+
+        let compact = event_output(event, false).unwrap();
+        assert_eq!(compact["params"], json!({"amount": "100"}));
+    }
+
+    #[test]
+    fn include_raw_returns_the_complete_event_row() {
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let event = EventRow {
+            event_id: "event-1".to_owned(),
+            contract_id: "contract-1".to_owned(),
+            ledger: 42,
+            ledger_closed_at: timestamp.clone(),
+            event_type: EventType::Contract,
+            topics: Json(vec!["raw-topic-xdr".to_owned()]),
+            decoded_topics: Json(json!(["transfer"])),
+            event_name: Some("transfer".to_owned()),
+            value: "raw-value-xdr".to_owned(),
+            decoded_value: Json(json!({"amount": "100"})),
+            enriched: None,
+            tx_hash: "tx-1".to_owned(),
+            in_successful_call: true,
+            paging_token: "paging-1".to_owned(),
+            created_at: timestamp,
+        };
+
+        let full = event_output(event, true).unwrap();
+        assert_eq!(full["topics"], json!(["raw-topic-xdr"]));
+        assert_eq!(full["value"], "raw-value-xdr");
+        assert_eq!(full["decoded_value"], json!({"amount": "100"}));
+        assert_eq!(full["paging_token"], "paging-1");
+        assert_eq!(full["created_at"], "2025-01-01T00:00:00Z");
+    }
 }
 
 async fn get_contract_stats(state: &State, contract_id: &str, limit: Option<i64>) -> anyhow::Result<Value> {
